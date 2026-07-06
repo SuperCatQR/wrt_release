@@ -1,0 +1,96 @@
+name: Weekly Redmi AX6 ImmortalWrt
+run-name: Weekly Redmi AX6 ImmortalWrt
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  MODEL: redmi_ax6_immwrt
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Build system setup
+        run: |
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E apt -yqq install dos2unix libfuse-dev
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set build date
+        run: |
+          echo "BUILD_DATE=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_ENV"
+
+      - name: Pre clone
+        run: ./wrt_core/pre_clone_action.sh "$MODEL"
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./action_build/.ccache
+            ./action_build/staging_dir
+            ./action_build/dl
+          key: ${{ runner.os }}-${{ env.MODEL }}-${{ hashFiles('**/repo_flag', 'wrt_core/deconfig/redmi_ax6_immwrt.config') }}-${{ env.BUILD_DATE }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.MODEL }}-${{ hashFiles('**/repo_flag', 'wrt_core/deconfig/redmi_ax6_immwrt.config') }}-
+            ${{ runner.os }}-${{ env.MODEL }}-
+
+      - name: Refresh cache stamps
+        run: |
+          if [ -d ./action_build/staging_dir ]; then
+            find ./action_build/staging_dir -type d -name stamp -not -path '*target*' | while read -r dir; do
+              find "$dir" -type f -exec touch {} +
+            done
+          fi
+
+      - name: Build firmware
+        run: |
+          set -euo pipefail
+          bash ./build.sh "$MODEL"
+
+      - name: Validate firmware
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(firmware/*redmi_ax6-stock*squashfs-sysupgrade.bin)
+          test "${#files[@]}" -eq 1
+          img="${files[0]}"
+          manifest=(firmware/*.manifest)
+          test "${#manifest[@]}" -ge 1
+          tar -xOf "$img" sysupgrade-redmi_ax6-stock/CONTROL | grep -qx 'BOARD=redmi_ax6-stock'
+          for pkg in luci-app-passwall xray-core sing-box chinadns-ng v2ray-geoip v2ray-geosite ddns-go luci-app-ddns-go dnsmasq-full luci-app-ttyd ttyd; do
+            grep -qx "$pkg .*" "${manifest[@]}"
+          done
+          for pkg in wireguard-tools kmod-wireguard luci-proto-wireguard rpcd-mod-wireguard pbr luci-app-pbr mwan3 vpn-policy-routing appfilter kmod-oaf luci-app-oaf smartdns luci-app-lucky luci-app-openclash tailscale luci-app-easytier adguardhome luci-app-adguardhome mosdns luci-app-mosdns; do
+            ! grep -qx "$pkg .*" "${manifest[@]}"
+          done
+          rev=$(sed -n "s/^DISTRIB_REVISION='\(.*\)'/\1/p" firmware/*.buildinfo 2>/dev/null | head -1 || true)
+          base="redmi_ax6_immwrt-stock-no_pbr_oaf_wg-${BUILD_DATE}${rev:+-$rev}"
+          cp "$img" "firmware/${base}.bin"
+          cp "${manifest[0]}" "firmware/${base}.manifest"
+          (cd firmware && sha256sum * > SHA256SUMS)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redmi_ax6_immwrt-stock-no_pbr_oaf_wg-${{ github.run_id }}
+          path: |
+            firmware/*redmi_ax6_immwrt-stock-no_pbr_oaf_wg-*
+            firmware/SHA256SUMS
+            firmware/*.buildinfo
+          retention-days: 30
