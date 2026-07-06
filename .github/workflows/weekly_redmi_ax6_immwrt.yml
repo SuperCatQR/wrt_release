@@ -1,18 +1,23 @@
-name: Weekly Redmi AX6 ImmortalWrt
-run-name: Weekly Redmi AX6 ImmortalWrt
+name: Auto Redmi AX6 ImmortalWrt
+run-name: Auto Redmi AX6 ImmortalWrt
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 0'
+    - cron: '0 3 * * *'
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 env:
   MODEL: redmi_ax6_immwrt
   TZ: Asia/Shanghai
+  GH_TOKEN: ${{ github.token }}
+
+concurrency:
+  group: redmi_ax6_immwrt-auto
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -20,7 +25,40 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect upstream update
+        id: upstream
+        run: |
+          set -euo pipefail
+          ini="wrt_core/compilecfg/${MODEL}.ini"
+          repo_url=$(awk -F= '$1=="REPO_URL"{print $2}' "$ini")
+          branch=$(awk -F= '$1=="REPO_BRANCH"{print $2}' "$ini")
+          branch=${branch:-main}
+          sha=$(git ls-remote "$repo_url" "refs/heads/$branch" | awk '{print $1}')
+          test -n "$sha"
+          short=${sha:0:12}
+          tag="${MODEL}-upstream-${short}"
+          echo "repo_url=$repo_url" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged: $sha ($tag already exists)"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream: $sha"
+          fi
+
+      - name: Stop if unchanged
+        if: steps.upstream.outputs.should_build == 'false'
+        run: echo "No new upstream commit; skip build."
+
       - name: Build system setup
+        if: steps.upstream.outputs.should_build == 'true'
         run: |
           sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
           sudo -E apt -yqq install dos2unix libfuse-dev
@@ -28,29 +66,30 @@ jobs:
           sudo -E apt -yqq autoclean
           sudo -E apt -yqq clean
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Set build date
+        if: steps.upstream.outputs.should_build == 'true'
         run: |
           echo "BUILD_DATE=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_ENV"
 
       - name: Pre clone
+        if: steps.upstream.outputs.should_build == 'true'
         run: ./wrt_core/pre_clone_action.sh "$MODEL"
 
       - name: Cache dependencies
+        if: steps.upstream.outputs.should_build == 'true'
         uses: actions/cache@v4
         with:
           path: |
             ./action_build/.ccache
             ./action_build/staging_dir
             ./action_build/dl
-          key: ${{ runner.os }}-${{ env.MODEL }}-${{ hashFiles('**/repo_flag', 'wrt_core/deconfig/redmi_ax6_immwrt.config') }}-${{ env.BUILD_DATE }}
+          key: ${{ runner.os }}-${{ env.MODEL }}-${{ steps.upstream.outputs.short }}-${{ hashFiles('wrt_core/deconfig/redmi_ax6_immwrt.config') }}
           restore-keys: |
-            ${{ runner.os }}-${{ env.MODEL }}-${{ hashFiles('**/repo_flag', 'wrt_core/deconfig/redmi_ax6_immwrt.config') }}-
+            ${{ runner.os }}-${{ env.MODEL }}-${{ steps.upstream.outputs.short }}-
             ${{ runner.os }}-${{ env.MODEL }}-
 
       - name: Refresh cache stamps
+        if: steps.upstream.outputs.should_build == 'true'
         run: |
           if [ -d ./action_build/staging_dir ]; then
             find ./action_build/staging_dir -type d -name stamp -not -path '*target*' | while read -r dir; do
@@ -59,11 +98,13 @@ jobs:
           fi
 
       - name: Build firmware
+        if: steps.upstream.outputs.should_build == 'true'
         run: |
           set -euo pipefail
           bash ./build.sh "$MODEL"
 
       - name: Validate firmware
+        if: steps.upstream.outputs.should_build == 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -80,12 +121,13 @@ jobs:
             ! grep -qx "$pkg .*" "${manifest[@]}"
           done
           rev=$(sed -n "s/^DISTRIB_REVISION='\(.*\)'/\1/p" firmware/*.buildinfo 2>/dev/null | head -1 || true)
-          base="redmi_ax6_immwrt-stock-no_pbr_oaf_wg-${BUILD_DATE}${rev:+-$rev}"
+          base="redmi_ax6_immwrt-stock-no_pbr_oaf_wg-${BUILD_DATE}-${{ steps.upstream.outputs.short }}${rev:+-$rev}"
           cp "$img" "firmware/${base}.bin"
           cp "${manifest[0]}" "firmware/${base}.manifest"
           (cd firmware && sha256sum * > SHA256SUMS)
 
       - name: Upload artifact
+        if: steps.upstream.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: redmi_ax6_immwrt-stock-no_pbr_oaf_wg-${{ github.run_id }}
@@ -94,3 +136,28 @@ jobs:
             firmware/SHA256SUMS
             firmware/*.buildinfo
           retention-days: 30
+
+      - name: Publish release
+        if: steps.upstream.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          body="release-notes.md"
+          cat > "$body" <<EOF
+Redmi AX6 ImmortalWrt auto build.
+
+- Model: ${MODEL}
+- Upstream: ${{ steps.upstream.outputs.repo_url }} ${{ steps.upstream.outputs.branch }}
+- Upstream commit: ${{ steps.upstream.outputs.sha }}
+- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+- Excluded: pbr/oaf/wireguard/smartdns/lucky/openclash/tailscale/easytier/adguardhome/mosdns
+
+Verify with SHA256SUMS before flashing.
+EOF
+          gh release create "${{ steps.upstream.outputs.tag }}" \
+            firmware/*redmi_ax6_immwrt-stock-no_pbr_oaf_wg-* \
+            firmware/SHA256SUMS \
+            firmware/*.buildinfo \
+            --target "$GITHUB_SHA" \
+            --title "Redmi AX6 ImmortalWrt ${{ steps.upstream.outputs.short }}" \
+            --notes-file "$body" \
+            --latest
